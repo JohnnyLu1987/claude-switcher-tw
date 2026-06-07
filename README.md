@@ -1,6 +1,6 @@
 # Claude 模式切換器（終端機 claude 指令適用）
 
-一鍵在 **原版訂閱** 與 **Free Claude Code** 之間切換 **終端機（PowerShell / cmd）裡的 `claude` 指令**，並可更換免費模型。
+一鍵在 **原版訂閱** 與 **Free Claude Code** 之間切換 **終端機（PowerShell / cmd）裡的 `claude` 指令**，並可快速更換免費模型。
 
 **最大好處**：切到 Free Claude Code 時，切換器會**自動在背景拉起 `fcc-server`**——你不用再另外開一個 cmd 去手動跑 fcc-server，點一下就能直接用免費模型。
 
