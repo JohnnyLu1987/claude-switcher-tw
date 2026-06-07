@@ -1,0 +1,12 @@
+# 本機自動產生的設定（含絕對路徑與權杖，不應公開；首次執行會自動重建）
+config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 執行記錄
+error.log
+
+# Claude Code 本機設定（含本機路徑與權限清單）
+.claude/settings.local.json
