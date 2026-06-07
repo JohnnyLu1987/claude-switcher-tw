@@ -6,6 +6,8 @@
 
 > 註：Claude Desktop 內建的 Claude Code（Cowork）會強制走官方 API，無法用本工具切換；本工具只作用於終端機的 `claude` 指令。
 
+![Claude 模式切換器狀態視窗](docs/screenshot.png)
+
 ---
 
 ## 前置需求

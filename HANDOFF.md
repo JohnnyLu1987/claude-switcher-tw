@@ -150,7 +150,8 @@ def auto_detect_paths():
    - Goal-Driven Execution —— 多步驟先列計畫、定驗收
 5. **遇到 fcc 連線問題** → 先看 `修復記錄-2026-06-05.md`，通常是 truststore 或 TLS 攔截
 6. **`.bat` 一律用 CRLF 換行**（LF 會讓 cmd 把指令攔腰切斷而報一堆莫名錯誤）
-7. **fcc 是 `uv tool` 安裝**：venv 在 `uv tool dir`\\`free-claude-code`，**沒有 pip 模組**，要裝套件用 `uv pip install --python <venv>\\Scripts\\python.exe <pkg>`，不能用 `python -m pip`
+7. **`.vbs` 一律用 UTF-16 LE + BOM + CRLF**（Windows Script Host 對 UTF-8 BOM 會報「無效字元」、無 BOM 又會用 CP950 誤判中文註解；存錯會出現「必須要有物件 sh」而無法啟動。注意：一般文字編輯器/工具預設常存成 UTF-8，改完務必確認編碼）
+8. **fcc 是 `uv tool` 安裝**：venv 在 `uv tool dir`\\`free-claude-code`，**沒有 pip 模組**，要裝套件用 `uv pip install --python <venv>\\Scripts\\python.exe <pkg>`，不能用 `python -m pip`
 
 ---
 
