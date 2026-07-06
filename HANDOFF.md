@@ -47,7 +47,14 @@
 - `probe_current()`：驗證目前 `.env` 的模型（走 claude 模型名，路徑同 Claude Code）。
 - `probe_candidate(display_name)`：驗證任一模型不改 `.env`（路由 id = `anthropic/` + display_name）。
 - `scan_all_models()`：全量掃描（併發 8，逐一 30s 逾時，可用 `stop_event` 中斷）。
+  **可續跑**：`resume=True` 時只補「未測 + busy(429)」，`unknown`(沒回應) 視為已測不重試 → 保證收斂；
+  **邊測邊存**（`save_every`）→ 中途停掉不白費。
+- 付費標註：`is_paid()`（OpenRouter 非 :free 者）→ 下拉以 `annotate_model()` 加「(付費模型)」，
+  套用前用 `strip_annotation()` 還原，避免把標註寫進 `.env`。
 - 快取：`model_availability.json`（已 gitignore）；`show_only_available` 存 `config.json` 供開機沿用。
+
+> **全量實測（2026-07-06，293 個去重後）**：可用 184（NVIDIA 40 / OpenRouter 免費 13 / 付費 131）、
+> 帳號無權限 53、沒回應 50、上游錯誤 6。
 
 > **NVIDIA 帳號實測**：`nemotron-3-super-120b`、`llama-3.1-70b` 可用；多數其他模型 404。
 > `nvidia_nim/z-ai/glm-5.2` 有權限但端點卡住（100s 零輸出），改用 `open_router/z-ai/glm-5.2` 正常。

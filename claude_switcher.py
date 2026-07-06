@@ -321,40 +321,74 @@ def probe_candidate(display_name, timeout=60):
     return _probe_request("anthropic/" + display_name, timeout)
 
 
-def scan_all_models(progress_cb=None, stop_event=None, timeout=30):
-    """逐一探測 /v1/models 的整個型錄，回傳 {model: status}。
+# 「定案」狀態：續跑時不再重測；其餘（busy=暫時限流、unknown=沒回應）下次會補測。
+DEFINITIVE = ("ok", "unavailable", "error")
 
-    - progress_cb(done, total, model, status)：每測完一個回報一次進度。
-    - stop_event：外部可 set() 來中斷；尚未開始的模型會被略過。
-    因 fcc 對每個 provider 有速率限制，client 端併發設低一點就好（設太高只會被 429）。
+
+def build_scan_list(scope="all"):
+    """依範圍組出要掃描的模型清單。
+    - "all"  ：整個型錄（NVIDIA + OpenRouter 全部）
+    - "free" ：NVIDIA 全部 + OpenRouter 免費（:free）——省額度、且是最適合免費用的
     """
-    models = list_models()
+    full = list_models()
+    if scope == "free":
+        return [m for m in full
+                if m.startswith("nvidia_nim/")
+                or (m.startswith("open_router/") and ":free" in m.lower())]
+    return full
+
+
+def scan_all_models(models=None, progress_cb=None, stop_event=None, timeout=30,
+                    resume=True, save_every=15):
+    """探測模型可用性，結果邊測邊寫進全域 _availability 與快取檔（可續跑）。
+
+    - models    ：要測的清單；None = 依 build_scan_list("all")。
+    - resume    ：True 時跳過已「定案」(ok/unavailable/error)的，只補未測與可重試(busy/unknown)。
+    - save_every：每測這麼多個就存檔一次，中途停掉也不白費。
+    - stop_event：外部可 set() 來中斷；尚未開始的會被略過。
+    回傳 (整體結果 dict, 這批清單總數 total, 這次實際測了幾個 tested)。
+    因 fcc 對每個 provider 有速率限制，client 端併發設低即可（設太高只會被 429）。
+    """
+    if models is None:
+        models = build_scan_list("all")
     total = len(models)
-    results = {}
+    ts = time.strftime("%Y-%m-%d %H:%M")
+    if resume:
+        # 續跑：只補「還沒測過」與「暫時限流(busy/429)」的。
+        # unknown（30 秒沒回應）視為已測、不再自動重試，確保掃描會收斂、不會鬼打牆。
+        todo = [m for m in models
+                if _availability.get(m) is None or _availability.get(m) == "busy"]
+    else:
+        todo = list(models)
     lock = threading.Lock()
-    counter = {"done": 0}
+    counter = {"done": 0, "since_save": 0}
 
     def one(m):
         if stop_event is not None and stop_event.is_set():
             return
         status, _ = probe_candidate(m, timeout=timeout)
         with lock:
-            results[m] = status
+            _availability[m] = status
             counter["done"] += 1
+            counter["since_save"] += 1
             done = counter["done"]
+            if counter["since_save"] >= save_every:
+                counter["since_save"] = 0
+                save_availability(dict(_availability), ts)
         if progress_cb:
-            progress_cb(done, total, m, status)
+            progress_cb(done, len(todo), m, status)
 
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=8)
     try:
-        futs = [ex.submit(one, m) for m in models]
+        futs = [ex.submit(one, m) for m in todo]
         for _ in concurrent.futures.as_completed(futs):
             if stop_event is not None and stop_event.is_set():
                 break
     finally:
         # 中斷時取消還沒開始的工作，不等待仍在跑的
         ex.shutdown(wait=False, cancel_futures=True)
-    return results, total
+    save_availability(dict(_availability), ts)   # 收尾存檔
+    return dict(_availability), total, counter["done"]
 
 
 # ---------- fcc-server 控制 ----------
@@ -480,19 +514,41 @@ def set_busy(text):
         b.config(state="disabled")
 
 
+# 付費模型標註：OpenRouter 非 :free 的都算付費（NVIDIA 走免費層，不標）。
+# 標註只用於「顯示」，套用前一律用 strip_annotation() 去掉，避免寫進 .env。
+PAID_SUFFIX = "　(付費模型)"
+
+
+def is_paid(model):
+    m = model.lower()
+    return m.startswith("open_router/") and ":free" not in m
+
+
+def annotate_model(model):
+    """顯示用：付費模型在名稱後加「(付費模型)」。"""
+    return model + PAID_SUFFIX if is_paid(model) else model
+
+
+def strip_annotation(text):
+    """把顯示用的標註去掉，還原成真正的模型名。"""
+    return text[:-len(PAID_SUFFIX)] if text.endswith(PAID_SUFFIX) else text
+
+
 def dropdown_values(full_models):
-    """依『只顯示可用模型』狀態，決定下拉選單要列哪些模型。
+    """依『只顯示可用模型』狀態決定下拉要列哪些，並替付費模型加上標註（顯示用）。
 
     開啟時：只留掃描快取判定為可用（ok/busy）的；但一定保留目前設定的模型，
     避免看不到自己現在用的是哪個。若還沒有任何快取，就退回顯示全部。
     """
     if _show_only and _availability:
-        vals = [m for m in full_models if _availability.get(m) in USABLE_STATUS]
-        cur = model_var.get().strip() if model_var else ""
-        if cur and cur not in vals:
-            vals = [cur] + vals
-        return vals or full_models
-    return full_models
+        raw = [m for m in full_models if _availability.get(m) in USABLE_STATUS]
+        cur = strip_annotation(model_var.get().strip()) if model_var else ""
+        if cur and cur not in raw:
+            raw = [cur] + raw
+        raw = raw or full_models
+    else:
+        raw = full_models
+    return [annotate_model(m) for m in raw]
 
 
 def update_toggle_btn():
@@ -557,7 +613,7 @@ def refresh():
             )
             widgets["model_box"]["values"] = dropdown_values(models)
             if model and model not in ("(未設定)", "(讀不到)"):
-                model_var.set(model)
+                model_var.set(annotate_model(model))
             for b in widgets.get("buttons", []):
                 b.config(state="normal")
             widgets["status_line"].config(text="就緒")
@@ -609,7 +665,7 @@ def on_switch():
 
 
 def on_apply_model():
-    model = model_var.get().strip()
+    model = strip_annotation(model_var.get().strip())   # 去掉「(付費模型)」標註再套用
     if not model:
         return
     ok = messagebox.askokcancel(
@@ -698,10 +754,10 @@ def on_scan_all():
     ok = messagebox.askokcancel(
         "測試全部模型",
         "即將測試全部模型（NVIDIA + OpenRouter，約 600 多個）。\n\n"
-        "• 這會花 20～40 分鐘，並消耗 API 額度\n"
-        "• 過程中可再按同一顆鈕『停止測試』中斷\n"
-        "• 結果會存檔，之後開啟直接讀取，不必重測\n\n"
-        "確定現在開始嗎？",
+        "• 邊測邊存、可續跑：已測過的不會重來，中途停掉也不白費\n"
+        "• 過程中可再按同一顆鈕『停止測試』中斷，下次接著測\n"
+        "• 首次測完約 20～40 分鐘，之後開啟直接讀快取\n\n"
+        "確定現在開始（或繼續）嗎？",
         parent=win,
     )
     if not ok:
@@ -721,28 +777,32 @@ def on_scan_all():
 
     def work():
         global _scanning
-        scanned_at = time.strftime("%Y-%m-%d %H:%M")
-        results, total = scan_all_models(prog, _scan_stop)
-        _availability.clear()
-        _availability.update(results)
-        save_availability(results, scanned_at)
+        # resume=True：跳過已定案的，只補未測與可重試的；邊測邊存
+        results, total, did = scan_all_models(
+            progress_cb=prog, stop_event=_scan_stop, resume=True)
 
         def done_ui():
             global _scanning
             _scanning = False
             widgets["scan_btn"].config(text="測試全部模型", state="normal")
             usable = sum(1 for s in results.values() if s in USABLE_STATUS)
-            tested = len(results)
+            tested = sum(1 for s in results.values() if s)
+            busy_n = sum(1 for s in results.values() if s == "busy")
+            remaining = max(0, total - tested)
             word = "已停止" if _scan_stop.is_set() else "完成"
             widgets["status_line"].config(
-                text=f"測試{word}：{tested}/{total} 已測，其中 {usable} 個可用")
+                text=f"測試{word}：本次補測 {did}，累計已測 {tested}/{total}，可用 {usable} 個")
             refresh()
-            messagebox.showinfo(
-                f"測試{word}",
-                f"已測 {tested} 個模型，其中 {usable} 個你的帳號可用。\n\n"
-                "現在可按『只顯示可用模型』只保留能用的。",
-                parent=win if (win and win.winfo_exists()) else None,
-            )
+            parts = [f"本次補測 {did} 個；累計已測 {tested}/{total}，其中 {usable} 個你的帳號可用。"]
+            if remaining > 0:
+                parts.append(f"還有 {remaining} 個未測，再按一次『測試全部模型』可續測。")
+            elif busy_n > 0:
+                parts.append(f"全部已測；其中 {busy_n} 個暫時限流(429)，稍後再按一次可補測。")
+            else:
+                parts.append("全部已測完 🎉")
+            parts.append("可按『只顯示可用模型』只保留能用的。")
+            messagebox.showinfo(f"測試{word}", "\n\n".join(parts),
+                                parent=win if (win and win.winfo_exists()) else None)
 
         root.after(0, done_ui)
 
