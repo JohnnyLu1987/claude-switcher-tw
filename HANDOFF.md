@@ -105,7 +105,7 @@ claude-switcher/
 ├── claude_switcher.py        # 核心程式（單檔 ~540 行）
 ├── config.json               # 設定檔（首次執行自動產生，可手動調整路徑/port/token）
 ├── install.bat               # 一鍵安裝：偵測 Python/fcc + 產生 config.json + 開機自啟捷徑
-├── 2-啟動切換器.vbs          # 背景啟動 pythonw.exe claude_switcher.py
+├── 啟動切換器.vbs            # 背景啟動 pythonw.exe claude_switcher.py
 ├── fix-fcc-tls.bat           # 在 fcc venv 裝 truststore + 寫 .pth 注入（解 TLS 攔截）
 ├── 啟動fcc-server.bat        # 手動啟動 fcc-server（備援）
 ├── 修復記錄-2026-06-05.md    # fcc 疑難雜症完整紀錄

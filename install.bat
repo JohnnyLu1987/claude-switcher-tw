@@ -54,7 +54,7 @@ set "LNKTARGET=%PYW%"
 set LNKARGS="%WORKDIR%\claude_switcher.py"
 powershell -NoProfile -Command "$ws=New-Object -ComObject WScript.Shell; $p=Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude 模式切換器.lnk'; $sc=$ws.CreateShortcut($p); $sc.TargetPath=$env:LNKTARGET; $sc.Arguments=$env:LNKARGS; $sc.WorkingDirectory=$env:WORKDIR; $sc.Save(); Write-Host ('  捷徑：' + $p)"
 if errorlevel 1 (
-  echo [注意] 捷徑建立失敗，可改用手動方式（雙擊 2-啟動切換器.vbs）。
+  echo [注意] 捷徑建立失敗，可改用手動方式（雙擊 啟動切換器.vbs）。
 )
 echo.
 
@@ -62,6 +62,6 @@ echo ============================================
 echo   [完成] 安裝成功！
 echo ============================================
 echo   - 開機會自動啟動，右下角出現圓點圖示
-echo   - 想立刻啟動：雙擊「2-啟動切換器.vbs」
+echo   - 想立刻啟動：雙擊「啟動切換器.vbs」
 echo.
 pause
