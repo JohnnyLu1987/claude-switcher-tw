@@ -8,5 +8,8 @@ __pycache__/
 # 執行記錄
 error.log
 
+# 「測試全部模型」的結果快取（本機/帳號專屬，會自動重建）
+model_availability.json
+
 # Claude Code 本機設定（含本機路徑與權限清單）
 .claude/settings.local.json

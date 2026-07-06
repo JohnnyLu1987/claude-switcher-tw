@@ -24,6 +24,7 @@ import shutil
 import threading
 import subprocess
 import urllib.request
+import concurrent.futures
 import webbrowser
 import winreg
 import ctypes
@@ -60,6 +61,8 @@ def auto_detect_config():
         "tiktoken_cache_dir": os.path.join(home, ".fcc", "tiktoken-cache"),
         "port": 8082,
         "auth_token": "freecc",
+        # 下拉選單是否只顯示「測試過可用」的模型（此狀態會被記住，開機沿用）
+        "show_only_available": False,
     }
 
 
@@ -85,6 +88,15 @@ def load_config():
     return defaults
 
 
+def save_config():
+    """把目前的 _cfg 寫回 config.json（用於記住『只顯示可用模型』等狀態）。"""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(_cfg, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
 _cfg = load_config()
 
 FCC_SERVER_EXE     = _cfg["fcc_server_exe"]
@@ -99,12 +111,49 @@ AUTH_TOKEN         = str(_cfg["auth_token"])      # 會寫進 ANTHROPIC_AUTH_TOK
 PROXY_BASE_URL = f"http://127.0.0.1:{PORT}"       # 會寫進 ANTHROPIC_BASE_URL
 HEALTH_URL     = f"{PROXY_BASE_URL}/health"
 MODELS_API     = f"{PROXY_BASE_URL}/v1/models"
+MESSAGES_API   = f"{PROXY_BASE_URL}/v1/messages"   # 驗證模型可用性時打這個端點
 ADMIN_URL      = f"{PROXY_BASE_URL}/admin"
 
 # 下拉選單預設可選的免費模型（可自行增減；下拉框也允許直接輸入完整模型名）
+# 註：這些是「已實測你的帳號可用」的預設候選，避免一開就選到沒權限的模型。
 FREE_MODELS = [
-    "nvidia_nim/nvidia/nemotron-3-super-120b-a12b",
+    "nvidia_nim/nvidia/nemotron-3-super-120b-a12b",   # 已實測可用
+    "nvidia_nim/meta/llama-3.1-70b-instruct",         # 已實測可用
+    "open_router/google/gemma-4-31b-it:free",         # OpenRouter 免費，已實測可用
+    "open_router/openai/gpt-oss-120b:free",           # OpenRouter 免費
+    "open_router/openai/gpt-oss-20b:free",            # OpenRouter 免費
 ]
+
+# 「測試全部模型」的結果快取檔（存在腳本同目錄）。內容：
+#   {"scanned_at": "2026-07-06 14:30", "results": {"<model>": "ok|busy|unavailable|error|unknown"}}
+# 因為完整掃描 600+ 個模型很耗時，掃一次就存檔，之後開啟直接讀取；需要時再手動重掃。
+AVAIL_CACHE_PATH = os.path.join(SCRIPT_DIR, "model_availability.json")
+
+# 判定為「可用」的狀態（busy 只是暫時限流，模型本身可用）
+USABLE_STATUS = ("ok", "busy")
+
+
+def load_availability():
+    """讀取模型可用性快取，回傳 {model: status}；讀不到就回空 dict。"""
+    try:
+        with open(AVAIL_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("results"), dict):
+            return data["results"]
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_availability(results, scanned_at):
+    """把整份掃描結果寫入快取檔。"""
+    try:
+        with open(AVAIL_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"scanned_at": scanned_at, "results": results},
+                      f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
 
 ENV_BASE  = "ANTHROPIC_BASE_URL"
 ENV_TOKEN = "ANTHROPIC_AUTH_TOKEN"
@@ -207,6 +256,107 @@ def list_models():
     return out
 
 
+# ---------- 模型可用性驗證（probe）----------
+# 背景：fcc 的 /v1/models 會列出整個上游型錄（NVIDIA 200+、OpenRouter 400+），
+# 但你的 API 金鑰通常只被授權其中一小部分。選到沒權限的模型時，上游會回
+# HTTP 404「Not found for account」，而 fcc 會把這段錯誤「當成模型的回答文字」
+# 用 200 OK 串流吐回來——所以表面上像成功、實際上模型只會胡言亂語，切換器
+# 若不主動驗證就無從得知。以下函式送一個極短請求並判讀結果。
+#
+# 分類回傳 (status, note)：
+#   "ok"          可用
+#   "unavailable" 你的帳號沒有此模型權限（404 / Not found for account）
+#   "busy"        暫時限流（429 / rate limit）——模型其實可用，稍後再試即可
+#   "error"       其他上游錯誤
+#   "unknown"     連不上或回應為空，無法判斷
+
+def classify_probe(raw):
+    """把 /v1/messages 的原始回應字串分類成 (status, note)。"""
+    low = raw.lower()
+    if "not found for account" in low or "returned http 404" in low:
+        return ("unavailable", "你的帳號沒有此模型的使用權限")
+    if "returned http 429" in low or "rate_limit" in low or "rate limit" in low:
+        return ("busy", "此模型暫時忙碌（限流），稍後再試即可")
+    if ("upstream provider" in low or "returned http 5" in low
+            or '"category": "api_error"' in low or '"type": "error"' in low):
+        return ("error", "上游回傳錯誤，換一個模型較保險")
+    # 有正式文字、思考(thinking)內容、或工具呼叫，都代表模型活著且有授權。
+    # 思考型模型可能在極短 max_tokens 下只吐 thinking 還沒吐正式文字，仍算可用。
+    if ('"text_delta"' in raw or '"type": "text"' in raw
+            or "thinking" in low or "tool_use" in low):
+        return ("ok", "可用")
+    return ("unknown", "無法判斷（回應為空或連不上）")
+
+
+def _probe_request(model_field, timeout):
+    """對指定 model 欄位送一個極短請求，回傳 (status, note)。"""
+    body = json.dumps({
+        "model": model_field,
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        MESSAGES_API, data=body, method="POST",
+        headers={
+            "x-api-key": AUTH_TOKEN,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except Exception:
+        return ("unknown", "無法判斷（回應為空或連不上）")
+    return classify_probe(raw)
+
+
+def probe_current(timeout=60):
+    """驗證『目前 .env 設定的模型』。用 claude 模型名，走的路徑和 Claude Code 一致。"""
+    return _probe_request("claude-sonnet-4", timeout)
+
+
+def probe_candidate(display_name, timeout=60):
+    """驗證某個候選模型（不改 .env）。fcc 的路由 id = 'anthropic/' + display_name。"""
+    return _probe_request("anthropic/" + display_name, timeout)
+
+
+def scan_all_models(progress_cb=None, stop_event=None, timeout=30):
+    """逐一探測 /v1/models 的整個型錄，回傳 {model: status}。
+
+    - progress_cb(done, total, model, status)：每測完一個回報一次進度。
+    - stop_event：外部可 set() 來中斷；尚未開始的模型會被略過。
+    因 fcc 對每個 provider 有速率限制，client 端併發設低一點就好（設太高只會被 429）。
+    """
+    models = list_models()
+    total = len(models)
+    results = {}
+    lock = threading.Lock()
+    counter = {"done": 0}
+
+    def one(m):
+        if stop_event is not None and stop_event.is_set():
+            return
+        status, _ = probe_candidate(m, timeout=timeout)
+        with lock:
+            results[m] = status
+            counter["done"] += 1
+            done = counter["done"]
+        if progress_cb:
+            progress_cb(done, total, m, status)
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+    try:
+        futs = [ex.submit(one, m) for m in models]
+        for _ in concurrent.futures.as_completed(futs):
+            if stop_event is not None and stop_event.is_set():
+                break
+    finally:
+        # 中斷時取消還沒開始的工作，不等待仍在跑的
+        ex.shutdown(wait=False, cancel_futures=True)
+    return results, total
+
+
 # ---------- fcc-server 控制 ----------
 def get_fcc_proc():
     """找出正在監聽指定 port 的程序（fcc-server）。"""
@@ -303,6 +453,11 @@ root = None
 win = None
 widgets = {}
 model_var = None
+_last_probe = {}  # {model_name: (status, note)}，記住最近一次驗證結果供狀態視窗顯示
+_availability = load_availability()          # {model: status}，開機時從快取檔載入
+_show_only = bool(_cfg.get("show_only_available", False))  # 下拉是否只顯示可用模型（記憶狀態）
+_scan_stop = threading.Event()               # set() 可中斷「測試全部模型」
+_scanning = False                            # 是否正在掃描中
 
 
 def make_image(color):
@@ -323,6 +478,28 @@ def set_busy(text):
         widgets["status_line"].config(text=text)
     for b in widgets.get("buttons", []):
         b.config(state="disabled")
+
+
+def dropdown_values(full_models):
+    """依『只顯示可用模型』狀態，決定下拉選單要列哪些模型。
+
+    開啟時：只留掃描快取判定為可用（ok/busy）的；但一定保留目前設定的模型，
+    避免看不到自己現在用的是哪個。若還沒有任何快取，就退回顯示全部。
+    """
+    if _show_only and _availability:
+        vals = [m for m in full_models if _availability.get(m) in USABLE_STATUS]
+        cur = model_var.get().strip() if model_var else ""
+        if cur and cur not in vals:
+            vals = [cur] + vals
+        return vals or full_models
+    return full_models
+
+
+def update_toggle_btn():
+    """更新切換鈕的文字，反映目前是『只顯示可用』還是『顯示全部』。"""
+    btn = widgets.get("toggle_btn")
+    if btn:
+        btn.config(text="顯示全部模型" if _show_only else "只顯示可用模型")
 
 
 def refresh():
@@ -354,11 +531,31 @@ def refresh():
                 text=("✅ 正常" if proxy else "⛔ 不通"),
                 fg=("#2ecc71" if proxy else "#e74c3c"),
             )
-            widgets["model"].config(text=model)
+            # 若最近驗證過這個模型，帶上可用性標記；沒驗證過就標「(未驗證)」
+            mark_map = {
+                "ok": ("　✅ 可用", "#2ecc71"),
+                "busy": ("　⏳ 暫時忙碌", "#f1c40f"),
+                "unavailable": ("　⛔ 帳號無權限", "#e74c3c"),
+                "error": ("　⛔ 上游錯誤", "#e74c3c"),
+                "unknown": ("　❔ 驗證失敗", "#e67e22"),
+            }
+            default_fg = "#dddddd"
+            # 先看本次套用的即時驗證結果，再退回全量掃描的快取
+            status = None
+            if model in _last_probe:
+                status = _last_probe[model][0]
+            elif model in _availability:
+                status = _availability[model]
+            if status and model not in ("(未設定)", "(讀不到)"):
+                suffix, color = mark_map.get(status, ("", default_fg))
+                widgets["model"].config(text=model + suffix, fg=color)
+            else:
+                mark = "　(未驗證)" if model not in ("(未設定)", "(讀不到)") else ""
+                widgets["model"].config(text=model + mark, fg=default_fg)
             widgets["switch_btn"].config(
                 text=("切換到原版訂閱" if is_free else "切換到 Free Claude Code")
             )
-            widgets["model_box"]["values"] = models
+            widgets["model_box"]["values"] = dropdown_values(models)
             if model and model not in ("(未設定)", "(讀不到)"):
                 model_var.set(model)
             for b in widgets.get("buttons", []):
@@ -418,21 +615,136 @@ def on_apply_model():
     ok = messagebox.askokcancel(
         "套用模型",
         f"將免費模型設定為：\n\n{model}\n\n"
-        "會重新啟動 fcc-server（不影響目前的模式設定）。確定嗎？",
+        "會重新啟動 fcc-server，並自動驗證這個模型你的帳號能不能用"
+        "（不影響目前的模式設定）。確定嗎？",
         parent=win,
     )
     if not ok:
         return
-    set_busy("套用模型中，請稍候…")
+    set_busy("套用模型並驗證中，請稍候…")
 
     def work():
         try:
             set_model_in_env(model)
             restart_fcc_server()
+            status, note = probe_current()
+            _last_probe[model] = (status, note)
+            root.after(0, lambda: _show_probe_result(model, status, note))
         except FileNotFoundError:
             _fcc_error_dialog()
         finally:
             root.after(0, refresh)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _show_probe_result(model, status, note):
+    """套用模型後，依驗證結果跳對應視窗（只提醒，不自動改設定）。"""
+    if status == "ok":
+        messagebox.showinfo(
+            "模型可用 ✅",
+            f"已套用並驗證成功：\n\n{model}\n\n"
+            "記得『開一個新的終端機視窗』再執行 claude 才會生效。",
+            parent=win if (win and win.winfo_exists()) else None,
+        )
+    elif status == "busy":
+        messagebox.showwarning(
+            "模型暫時忙碌 ⏳",
+            f"{model}\n\n{note}\n\n"
+            "設定已套用；此模型其實可用，只是上游暫時限流。\n"
+            "可稍後再試，或先換另一個模型。",
+            parent=win if (win and win.winfo_exists()) else None,
+        )
+    else:  # unavailable / error / unknown
+        messagebox.showwarning(
+            "模型可能無法使用 ⛔",
+            f"{model}\n\n{note}\n\n"
+            "設定已套用，但驗證未通過——用這個模型時 claude 可能只會回錯誤訊息。\n"
+            "建議按『測試全部模型』找出能用的，再挑一個換上。",
+            parent=win if (win and win.winfo_exists()) else None,
+        )
+
+
+def on_toggle_available():
+    """切換下拉選單『只顯示可用模型』⇄『顯示全部模型』，狀態會被記住。"""
+    global _show_only
+    turning_on = not _show_only
+    if turning_on and not any(s in USABLE_STATUS for s in _availability.values()):
+        # 還沒有掃描結果，無從篩選——問要不要現在掃
+        go = messagebox.askokcancel(
+            "尚未測試模型",
+            "還沒有可用模型的測試結果，無法篩選。\n\n"
+            "要現在開始『測試全部模型』嗎？（約 20～40 分鐘，可中途停止）",
+            parent=win,
+        )
+        if go:
+            on_scan_all()
+        return
+    _show_only = turning_on
+    _cfg["show_only_available"] = _show_only
+    save_config()                      # 記住狀態，下次開啟沿用
+    update_toggle_btn()
+    refresh()
+
+
+def on_scan_all():
+    """測試全部模型（NVIDIA + OpenRouter），結果存快取檔。再按一次可中途停止。"""
+    global _scanning
+    if _scanning:                      # 掃描中再按 → 停止
+        _scan_stop.set()
+        widgets["scan_btn"].config(text="停止中…", state="disabled")
+        return
+
+    ok = messagebox.askokcancel(
+        "測試全部模型",
+        "即將測試全部模型（NVIDIA + OpenRouter，約 600 多個）。\n\n"
+        "• 這會花 20～40 分鐘，並消耗 API 額度\n"
+        "• 過程中可再按同一顆鈕『停止測試』中斷\n"
+        "• 結果會存檔，之後開啟直接讀取，不必重測\n\n"
+        "確定現在開始嗎？",
+        parent=win,
+    )
+    if not ok:
+        return
+
+    _scanning = True
+    _scan_stop.clear()
+    # 掃描期間停用其他鈕，只留掃描鈕可按（用來停止）
+    for b in widgets.get("buttons", []):
+        if b is not widgets.get("scan_btn"):
+            b.config(state="disabled")
+    widgets["scan_btn"].config(text="停止測試", state="normal")
+
+    def prog(done, total, _m, _st):
+        root.after(0, lambda: widgets["status_line"].config(
+            text=f"測試中 {done}/{total}…（可按『停止測試』中斷）"))
+
+    def work():
+        global _scanning
+        scanned_at = time.strftime("%Y-%m-%d %H:%M")
+        results, total = scan_all_models(prog, _scan_stop)
+        _availability.clear()
+        _availability.update(results)
+        save_availability(results, scanned_at)
+
+        def done_ui():
+            global _scanning
+            _scanning = False
+            widgets["scan_btn"].config(text="測試全部模型", state="normal")
+            usable = sum(1 for s in results.values() if s in USABLE_STATUS)
+            tested = len(results)
+            word = "已停止" if _scan_stop.is_set() else "完成"
+            widgets["status_line"].config(
+                text=f"測試{word}：{tested}/{total} 已測，其中 {usable} 個可用")
+            refresh()
+            messagebox.showinfo(
+                f"測試{word}",
+                f"已測 {tested} 個模型，其中 {usable} 個你的帳號可用。\n\n"
+                "現在可按『只顯示可用模型』只保留能用的。",
+                parent=win if (win and win.winfo_exists()) else None,
+            )
+
+        root.after(0, done_ui)
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -491,9 +803,21 @@ def build_window():
     box = ttk.Combobox(mf, textvariable=model_var, width=34)
     box.pack(side="left", fill="x", expand=True)
     widgets["model_box"] = box
-    apply_model_btn = tk.Button(win, text="套用此模型", command=on_apply_model,
+
+    btn_row = tk.Frame(win, bg=bg)
+    btn_row.pack(fill="x", padx=14, pady=(2, 8))
+    toggle_btn = tk.Button(btn_row, command=on_toggle_available,
+                           font=("Microsoft JhengHei", 9))
+    toggle_btn.pack(side="left")
+    widgets["toggle_btn"] = toggle_btn
+    update_toggle_btn()               # 依記憶的狀態設定文字
+    scan_btn = tk.Button(btn_row, text="測試全部模型", command=on_scan_all,
+                         font=("Microsoft JhengHei", 9))
+    scan_btn.pack(side="left", padx=(6, 0))
+    widgets["scan_btn"] = scan_btn
+    apply_model_btn = tk.Button(btn_row, text="套用此模型", command=on_apply_model,
                                 font=("Microsoft JhengHei", 9))
-    apply_model_btn.pack(padx=14, pady=(2, 8), anchor="e")
+    apply_model_btn.pack(side="right")
 
     tk.Frame(win, bg="#333333", height=1).pack(fill="x", padx=14, pady=2)
 
@@ -518,7 +842,8 @@ def build_window():
     status_line.pack(fill="x", side="bottom")
     widgets["status_line"] = status_line
 
-    widgets["buttons"] = [switch_btn, admin_btn, apply_model_btn, close_btn]
+    widgets["buttons"] = [switch_btn, admin_btn, toggle_btn, scan_btn,
+                          apply_model_btn, close_btn]
 
     win.protocol("WM_DELETE_WINDOW", win.withdraw)
     win.update_idletasks()

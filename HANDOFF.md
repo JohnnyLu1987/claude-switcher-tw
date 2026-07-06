@@ -29,6 +29,28 @@
 | 自動啟動 fcc-server（隱藏視窗） | ✅ | 切到 Free 時若未啟動自動拉起 |
 | 開機自啟說明 | ✅ | README 有捷徑放法 |
 | 修復記錄文件化 | ✅ | `修復記錄-2026-06-05.md` |
+| 套用模型後自動驗證可用性 | ✅ | probe `/v1/messages`，區分 可用/帳號無權限(404)/暫時限流(429) |
+| 「測試全部模型」+ 結果快取 | ✅ | 掃 NVIDIA+OpenRouter ~670 個，存 `model_availability.json`，可中途停止 |
+| 「只顯示可用模型」切換鈕（有記憶） | ✅ | 狀態存 `config.json` 的 `show_only_available`，開機沿用；可切回顯示全部 |
+
+---
+
+## 模型可用性驗證機制（2026-07-06 新增）
+
+**背景問題**：fcc 的 `/v1/models` 會列出整個上游型錄，但使用者的 API 金鑰通常只被授權其中一小部分。
+選到沒權限的模型時，上游回 HTTP 404「Not found for account」，而 **fcc 會把這段錯誤當成模型的回答、用 200 OK 串流吐回**，
+所以表面像成功、實際 claude 只會胡言亂語，切換器若不主動驗證就無從得知。
+
+**解法**（都在 `claude_switcher.py`）：
+- `classify_probe(raw)`：判讀回應 → `ok` / `unavailable`(404) / `busy`(429，暫時限流仍算可用) / `error` / `unknown`。
+  注意：思考型模型可能只吐 thinking 還沒吐正式文字，也算 `ok`（否則會誤判 GLM-5.2 這類模型）。
+- `probe_current()`：驗證目前 `.env` 的模型（走 claude 模型名，路徑同 Claude Code）。
+- `probe_candidate(display_name)`：驗證任一模型不改 `.env`（路由 id = `anthropic/` + display_name）。
+- `scan_all_models()`：全量掃描（併發 8，逐一 30s 逾時，可用 `stop_event` 中斷）。
+- 快取：`model_availability.json`（已 gitignore）；`show_only_available` 存 `config.json` 供開機沿用。
+
+> **NVIDIA 帳號實測**：`nemotron-3-super-120b`、`llama-3.1-70b` 可用；多數其他模型 404。
+> `nvidia_nim/z-ai/glm-5.2` 有權限但端點卡住（100s 零輸出），改用 `open_router/z-ai/glm-5.2` 正常。
 
 ---
 
@@ -106,7 +128,7 @@ claude-switcher/
 2. **硬編碼路徑** — 僅適用 Johnny 自己的電腦
 3. **Python 版本** — 切換器用 3.12 跑，fcc 需 3.14+（uv tool 會自動管理）
 4. **truststore 注入** — 屬 fcc 端修復，切換器只能設 `TIKTOKEN_CACHE_DIR`、移除 `SSL_CERT_FILE`
-5. **NVIDIA 模型首發驗證曾失敗** — 建議使用者先在 Admin 頁確認 API Key、或換模型
+5. **多數上游模型你的帳號沒權限** — 已用「測試全部模型 / 只顯示可用模型」處理（見上方新增章節）
 6. **無自動更新 / 版本號機制**
 
 ---
